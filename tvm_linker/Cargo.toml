@@ -31,7 +31,7 @@ num-traits = "^0.2.8"
 
 ton_abi = { git = "https://github.com/tonlabs/ton-labs-abi.git" }
 ton_block = { git = "https://github.com/tonlabs/ton-labs-block.git" }
-ton_labs_assembler = { git = "https://github.com/nilfoundation/tvmasm.git", branch = "1-vergrth16" }
+ton_labs_assembler = { git = "https://github.com/nilfoundation/tvm-asm.git", branch = "1-vergrth16" }
 ton_sdk = { git = "https://github.com/tonlabs/ton-sdk.git", default-features = false }
 ton_types = { git = "https://github.com/tonlabs/ton-labs-types.git" }
-ton_vm = { git = "https://github.com/tonlabs/ton-labs-vm.git", default-features = false }
+ton_vm = { git = "https://github.com/nilfoundation/rust-tvm.git", default-features = false, branch = "1-vergrth16-tvm-instruction" }
