@@ -1148,7 +1148,7 @@ impl Handlers {
             .set(0x02, disasm_sha256u)
             .set(0x10, disasm_chksignu)
             .set(0x11, disasm_chksigns)
-            .set(0x11, disasm_vergrth16)
+            .set(0x12, disasm_vergrth16)
             .set(0x40, disasm_cdatasizeq)
             .set(0x41, disasm_cdatasize)
             .set(0x42, disasm_sdatasizeq)
