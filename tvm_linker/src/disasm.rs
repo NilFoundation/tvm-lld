@@ -1180,6 +1180,7 @@ impl Handlers {
             .set(0x02, disasm_sha256u)
             .set(0x10, disasm_chksignu)
             .set(0x11, disasm_chksigns)
+            .set(0x12, disasm_vergrth16)
             .set(0x40, disasm_cdatasizeq)
             .set(0x41, disasm_cdatasize)
             .set(0x42, disasm_sdatasizeq)
@@ -2670,6 +2671,7 @@ create_handler_2!(disasm_hashsu,     0xf901, "HASHSU");
 create_handler_2!(disasm_sha256u,    0xf902, "SHA256U");
 create_handler_2!(disasm_chksignu,   0xf910, "CHKSIGNU");
 create_handler_2!(disasm_chksigns,   0xf911, "CHKSIGNS");
+create_handler_2!(disasm_vergrth16,  0xf912, "VERGRTH16");
 create_handler_2!(disasm_cdatasizeq, 0xf940, "CDATASIZEQ");
 create_handler_2!(disasm_cdatasize,  0xf941, "CDATASIZE");
 create_handler_2!(disasm_sdatasizeq, 0xf942, "SDATASIZEQ");
