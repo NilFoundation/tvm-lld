@@ -1,8 +1,8 @@
 [package]
 build = "build/build.rs"
 name = "tvm_linker"
-description = "TVM linker"
-version = "0.1.0"
+description = "TVM Linker"
+version = "0.3.0"
 authors = ["TON DEV SOLUTIONS LTD <support@tonlabs.io>"]
 readme = "README.md"
 license-file = "LICENSE.md"
@@ -35,3 +35,7 @@ ton_labs_assembler = { git = "https://github.com/nilfoundation/tvm-asm.git", bra
 ton_sdk = { git = "https://github.com/tonlabs/ton-sdk.git", default-features = false }
 ton_types = { git = "https://github.com/tonlabs/ton-labs-types.git" }
 ton_vm = { git = "https://github.com/nilfoundation/rust-tvm.git", default-features = false, branch = "1-vergrth16-tvm-instruction" }
+
+[dev-dependencies]
+assert_cmd = "0.11"
+predicates = "1"

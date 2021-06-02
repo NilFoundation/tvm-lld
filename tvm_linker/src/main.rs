@@ -45,7 +45,6 @@ mod real_ton;
 mod resolver;
 mod methdict;
 mod testcall;
-mod debug_info;
 mod disasm;
 
 use abi::{build_abi_body, decode_body, load_abi_json_string, load_abi_contract};
@@ -56,22 +55,18 @@ use parser::{ParseEngine, ParseEngineResults};
 use program::{Program, get_now};
 use real_ton::{decode_boc, compile_message};
 use resolver::resolve_name;
-use std::path::Path;
-use testcall::{call_contract, MsgInfo};
+use ton_block::{Deserializable, Message};
+use std::{path::Path};
+use testcall::{call_contract, MsgInfo, TraceLevel};
 use ton_types::{BuilderData, SliceData};
 use std::env;
-use disasm::{create_disasm_command, disasm_command};
-use parser::Line;
+use disasm::disasm_command;
+use ton_labs_assembler::Line;
+use std::fs::File;
+
+use crate::real_ton::load_stateinit;
 
 fn main() -> Result<(), i32> {
-    println!(
-        "TVM linker {}\nCOMMIT_ID: {}\nBUILD_DATE: {}\nCOMMIT_DATE: {}\nGIT_BRANCH: {}",
-        env!("CARGO_PKG_VERSION"),
-        env!("BUILD_GIT_COMMIT"),
-        env!("BUILD_TIME") ,
-        env!("BUILD_GIT_DATE"),
-        env!("BUILD_GIT_BRANCH")
-    );
     linker_main().map_err(|err_str| {
         println!("Error: {}", err_str);
         1
@@ -79,26 +74,29 @@ fn main() -> Result<(), i32> {
 }
 
 fn linker_main() -> Result<(), String> {
-    let build_info = match option_env!("BUILD_INFO") {
-        Some(s) => s,
-        None => "",
-    };
-    let matches = clap_app! (tvm_linker =>
-        (version: &*format!("0.1 ({})", build_info))
-        (author: "TONLabs")
-        (about: "Linker for TVM assembly")
+    let build_info = format!(
+        "v{}\nBUILD_GIT_COMMIT: {}\nBUILD_GIT_DATE:   {}\nBUILD_TIME:       {}",
+        env!("CARGO_PKG_VERSION"),
+        env!("BUILD_GIT_COMMIT"),
+        env!("BUILD_GIT_DATE"),
+        env!("BUILD_TIME") ,
+    );
+    let matches = clap_app!(tvm_linker =>
+        (version: build_info.as_str())
+        (author: "TON Labs")
+        (about: "Tool for assembling, disassembling and executing TVM code")
         (@subcommand decode =>
-            (about: "Decode real TON message")
-            (version: "0.1")
-            (author: "TONLabs")
+            (about: "take apart a message boc or a tvc file")
+            (version: build_info.as_str())
+            (author: "TON Labs")
             (@arg INPUT: +required +takes_value "BOC file")
             (@arg TVC: --tvc "BOC file is tvc file")
         )
         (@subcommand compile =>
             (@setting AllowNegativeNumbers)
             (about: "compile contract")
-            (version: "0.1")
-            (author: "TONLabs")
+            (version: build_info.as_str())
+            (author: "TON Labs")
             (@arg INPUT: +required +takes_value "TVM assembler source file")
             (@arg ABI: -a --("abi-json") +takes_value "Supplies contract abi to calculate correct function ids. If not specified abi is loaded from file path obtained from <INPUT> path if it exists.")
             (@arg CTOR_PARAMS: -p --("ctor-params") +takes_value "Supplies arguments for the constructor")
@@ -106,7 +104,8 @@ fn linker_main() -> Result<(), String> {
             (@arg SETKEY: --setkey +takes_value conflicts_with[GENKEY] "Loads existing keypair from the file")
             (@arg WC: -w +takes_value "Workchain id used to print contract address, -1 by default.")
             (@arg DEBUG: --debug "Prints debug info: xref table and parsed assembler sources")
-            (@arg DEBUG_INFO: --("debug-info") "Generates file with debug information")
+            (@arg DEBUG_MAP: --("debug-map") +takes_value "Generates debug map file")
+            (@arg DATA: --("data") +takes_value "Overwrites data with a cell from a file")
             (@arg LIB: --lib +takes_value ... number_of_values(1) "Standard library source file. If not specified lib is loaded from environment variable TVM_LINKER_LIB_PATH if it exists.")
             (@arg OUT_FILE: -o +takes_value "Output file name")
             (@arg LANGUAGE: --language +takes_value "Enable language-specific features in linkage")
@@ -114,12 +113,14 @@ fn linker_main() -> Result<(), String> {
         (@subcommand test =>
             (@setting AllowLeadingHyphen)
             (about: "execute contract in test environment")
-            (version: "0.1")
-            (author: "TONLabs")
+            (version: build_info.as_str())
+            (author: "TON Labs")
             (@arg SOURCE: -s --source +takes_value "Contract source file")
-            (@arg BODY: --body +takes_value "Body for external inbound message (hex string)")
+            (@arg BODY: --body +takes_value "Body for external inbound message (a bitstring like x09c_ or a hex string)")
+            (@arg BODY_FROM_BOC: --("body-from-boc") +takes_value "Body from message boc file")
             (@arg SIGN: --sign +takes_value "Signs body with private key from defined file")
             (@arg TRACE: --trace "Prints last command name, stack and registers after each executed TVM command")
+            (@arg TRACE_MIN: --("trace-minimal") "Prints minimal trace")
             (@arg DECODEC6: --("decode-c6") "Prints last command name, stack and registers after each executed TVM command")
             (@arg INTERNAL: --internal +takes_value "Emulates inbound internal message with value instead of external message")
             (@arg BOUNCED: --bounced requires[INTERNAL] "Emulates bounced message, can be used only with --internal option.")
@@ -128,6 +129,7 @@ fn linker_main() -> Result<(), String> {
             (@arg NOW: --now +takes_value "Supplies transaction creation unixtime")
             (@arg TICKTOCK: --ticktock +takes_value conflicts_with[BODY] "Emulates ticktock transaction in masterchain, 0 for tick and -1 for tock")
             (@arg GASLIMIT: -l --("gas-limit") +takes_value "Defines gas limit for tvm execution")
+            (@arg CONFIG: --config +takes_value "Imports config parameters from a config contract boc")
             (@arg INPUT: +required +takes_value "TVM assembler source file or contract name if used with test subcommand")
             (@arg ABI_JSON: -a --("abi-json") +takes_value conflicts_with[BODY] "Supplies json file with contract ABI")
             (@arg ABI_METHOD: -m --("abi-method") +takes_value conflicts_with[BODY] "Supplies the name of the calling contract method")
@@ -137,8 +139,8 @@ fn linker_main() -> Result<(), String> {
         (@subcommand message =>
             (@setting AllowNegativeNumbers)
             (about: "generate external inbound message for the blockchain")
-            (version: "0.1")
-            (author: "TONLabs")
+            (version: build_info.as_str())
+            (author: "TON Labs")
             (@arg INIT: -i --init "Generates constructor message with code and data of the contract")
             (@arg DATA: -d --data +takes_value "Supplies body for the message in hex format (empty data by default)")
             (@arg WORKCHAIN: -w --workchain +takes_value "Supplies workchain id for the contract address")
@@ -151,11 +153,42 @@ fn linker_main() -> Result<(), String> {
         )
         (@subcommand init =>
             (about: "initialize smart contract public variables")
+            (version: build_info.as_str())
             (@arg INPUT: +required +takes_value "Path to compiled smart contract file")
             (@arg DATA: +required +takes_value "Set of public variables with values in json format")
             (@arg ABI: +required +takes_value "Path to smart contract ABI file")
         )
-        (subcommand: create_disasm_command())
+        (@subcommand disasm =>
+            (about: "disassemble a tvc or dumps its tree of cells")
+            (version: build_info.as_str())
+            (author: "TON Labs")
+            (@subcommand dump =>
+                (about: "dumps tree of cells for the given tvc")
+                (version: build_info.as_str())
+                (@arg TVC: +required +takes_value "Path to tvc file")
+            )
+            (@subcommand graphviz =>
+                (about: "generates graphviz dot for the given tvc")
+                (version: build_info.as_str())
+                (@arg METHOD: --method +takes_value "Selects a particular method by ID or int|ext|ticktock")
+                (@arg TVC: +required +takes_value "Path to tvc file")
+            )
+            (@subcommand solidity =>
+                (about: "disassembles the given tvc produced by Solidity compiler")
+                (version: build_info.as_str())
+                (@arg TVC: +required +takes_value "Path to tvc file")
+            )
+            (@subcommand solidity_v1 =>
+                (about: "disassembles the given tvc produced by Solidity compiler, obsolete version")
+                (version: build_info.as_str())
+                (@arg TVC: +required +takes_value "Path to tvc file")
+            )
+            (@subcommand fun_c =>
+                (about: "disassembles the given tvc produced by FunC compiler")
+                (version: build_info.as_str())
+                (@arg TVC: +required +takes_value "Path to tvc file")
+            )
+        )
         (@setting SubcommandRequired)
     ).get_matches();
 
@@ -235,6 +268,16 @@ fn linker_main() -> Result<(), String> {
             }
             sources.push(path);
         }
+        let env_lib = env::var("TVM_LINKER_LIB_PATH").unwrap_or_default();
+        if sources.is_empty() && !env_lib.is_empty() {
+            println!("TVM_LINKER_LIB_PATH: {:?}", &env_lib);
+            let path = Path::new(&env_lib);
+            if !path.exists() {
+                return Err(format!("File {} doesn't exist", &env_lib));
+            }
+            sources.push(path);
+        }
+            
         let path = Path::new(input);
         if !path.exists() {
             return Err(format!("File {} doesn't exist", input));
@@ -268,8 +311,6 @@ fn linker_main() -> Result<(), String> {
            prog.debug_print();
         }
 
-        let debug_info = compile_matches.is_present("DEBUG_INFO");
-
         let wc = compile_matches.value_of("WC")
             .map(|wc| i8::from_str_radix(wc, 10).unwrap_or(-1))
             .unwrap_or(-1);
@@ -280,7 +321,16 @@ fn linker_main() -> Result<(), String> {
             return Err(msg.to_string());
         }
 
-        prog.compile_to_file_ex(wc, abi_file, ctor_params, out_file, debug, debug_info)?;
+        let data_filename = compile_matches.value_of("DATA");
+
+        prog.compile_to_file_ex(wc, abi_file, ctor_params, out_file, debug, data_filename)?;
+
+        if compile_matches.is_present("DEBUG_MAP") {
+            let filename = compile_matches.value_of("DEBUG_MAP").unwrap();
+            let file = File::create(filename).unwrap();
+            serde_json::to_writer_pretty(file, &prog.dbgmap).unwrap();
+        }
+
         return Ok(());
     }
 
@@ -323,6 +373,19 @@ fn run_init_subcmd(matches: &ArgMatches) -> Result<(), String> {
     set_initial_data(tvc, None, vars, abi)
 }
 
+fn decode_hex_string(hex_str: String) -> Result<(Vec<u8>, usize), String> {
+    if hex_str.to_ascii_lowercase().starts_with('x') {
+        let buf = SliceData::from_string(&hex_str[1..])
+            .map_err(|_| format!("body {} is invalid literal slice", hex_str))?;
+        Ok((buf.get_bytestring(0), buf.remaining_bits()))
+    } else {
+        let buf = hex::decode(&hex_str)
+            .map_err(|_| format!("body {} is invalid hex string", hex_str))?;
+        let buf_bits = buf.len() * 8;
+        Ok((buf, buf_bits))
+    }
+}
+
 fn run_test_subcmd(matches: &ArgMatches) -> Result<(), String> {
     let (body, sign) = match matches.value_of("BODY") {
         Some(hex_str) => {
@@ -341,7 +404,7 @@ fn run_test_subcmd(matches: &ArgMatches) -> Result<(), String> {
                 None => None
             };
 
-            let line = Line { text: hex_str.clone(), filename: "".to_string(), line: 0 };
+            let line = Line::new(hex_str.as_str(), "", 0);
             let resolved = resolve_name(&line, |name| {
                 let id = match &parse_results {
                     Some(parse_results) => parse_results.global_by_name(name),
@@ -352,9 +415,7 @@ fn run_test_subcmd(matches: &ArgMatches) -> Result<(), String> {
             .map_err(|e| format!("failed to resolve body {}: {}", hex_str, e))?;
             hex_str = resolved[0].text.clone();
 
-            let buf = hex::decode(&hex_str)
-                .map_err(|_| format!("body {} is invalid hex string", hex_str))?;
-            let buf_bits = buf.len() * 8;
+            let (buf, buf_bits) = decode_hex_string(hex_str).unwrap();
             let body: SliceData = BuilderData::with_raw(buf, buf_bits)
                 .map_err(|e| format!("failed to pack body in cell: {}", e))?
                 .into();
@@ -383,34 +444,51 @@ fn run_test_subcmd(matches: &ArgMatches) -> Result<(), String> {
         None => None
     };
 
-    let debug_info_filename = format!("{}{}", abi_json.map_or("debug_info.", |a| a.trim_end_matches("abi.json")), "debug.json");
+    let debug_map_filename = format!("{}{}", abi_json.map_or("debug_map.", |a| a.trim_end_matches("abi.json")), "map.json");
 
     println!("TEST STARTED");
     println!("body = {:?}", body);
 
-    let msg_info = MsgInfo {
+    let mut msg_info = MsgInfo {
         balance: matches.value_of("INTERNAL"),
         src: matches.value_of("SRCADDR"),
-        now: now,
+        now,
         bounced: matches.is_present("BOUNCED"),
-        body: body,
+        body,
     };
+
+    match matches.value_of("BODY_FROM_BOC") {
+        Some(filename) => {
+            let (mut root_slice, _) = load_stateinit(filename);
+            let msg = Message::construct_from(&mut root_slice).expect("cannot read message from slice");
+            msg_info.body = msg.body();
+        }
+        None => {}
+    }
 
     let gas_limit = matches.value_of("GASLIMIT")
         .map(|v| i64::from_str_radix(v, 10))
         .transpose()
         .map_err(|e| format!("cannot parse gas limit value: {}", e))?;
-    
+
+    let mut trace_level = TraceLevel::None;
+    if matches.is_present("TRACE") {
+        trace_level = TraceLevel::Full;
+    } else if matches.is_present("TRACE_MIN") {
+        trace_level = TraceLevel::Minimal;
+    }
+
     call_contract(
         matches.value_of("INPUT").unwrap(),
         matches.value_of("BALANCE"),
         msg_info,
+        matches.value_of("CONFIG"),
         sign,
         ticktock,
         gas_limit,
         if matches.is_present("DECODEC6") { Some(action_decoder) } else { None },
-        matches.is_present("TRACE"),
-        debug_info_filename,
+        trace_level,
+        debug_map_filename,
     );
 
     println!("TEST COMPLETED");

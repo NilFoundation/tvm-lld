@@ -18,6 +18,7 @@ use crate::printer::msg_printer;
 use program::{load_from_file, save_to_file, get_now};
 use simplelog::{SimpleLogger, Config, LevelFilter};
 use serde_json::Value;
+use std::fs::File;
 use std::str::FromStr;
 use std::sync::Arc;
 use ton_vm::executor::{Engine, EngineTraceInfo, EngineTraceInfoType, gas::gas_state::Gas};
@@ -30,7 +31,7 @@ use ton_block::{
     InternalMessageHeader, Message, MsgAddressExt, MsgAddressInt, OutAction,
     OutActions, Serializable, StateInit, UnixTime32
 };
-use debug_info::{load_debug_info, ContractDebugInfo};
+use ton_labs_assembler::DbgInfo;
 
 const DEFAULT_ACCOUNT_BALANCE: &str = "100000000000";
 
@@ -94,12 +95,15 @@ fn sign_body(body: &mut SliceData, key_file: Option<&str>) {
     *body = signed_body.into();
 }
 
-fn initialize_registers(data: SliceData, myself: MsgAddressInt, now: u32, balance: (u64, CurrencyCollection)) -> SaveList {
+fn initialize_registers(data: SliceData, myself: MsgAddressInt, now: u32, balance: (u64, CurrencyCollection), config: Option<Cell>) -> SaveList {
     let mut ctrls = SaveList::new();
     let mut info = SmartContractInfo::with_myself(myself.write_to_new_cell().unwrap().into());
     *info.balance_remaining_grams_mut() = balance.0 as u128;
     *info.balance_remaining_other_mut() = balance.1.other_as_hashmap().clone();
     *info.unix_time_mut() = now;
+    if let Some(cell) = config {
+        info.set_config_params(cell);
+    }
     ctrls.put(4, &mut StackItem::Cell(data.into_cell())).unwrap();
     ctrls.put(7, &mut info.into_temp_data()).unwrap();
     ctrls
@@ -235,26 +239,49 @@ pub struct MsgInfo<'a> {
     pub body: Option<SliceData>,
 }
 
+pub fn load_debug_info(
+    filename: String,
+) -> Option<DbgInfo> {
+    match File::open(filename) {
+        Ok(file) => Some(serde_json::from_reader(file).unwrap()),
+        Err(_) => None
+    }
+}
+
+#[derive(PartialEq)]
+pub enum TraceLevel {
+    Full,
+    Minimal,
+    None
+}
+
 pub fn call_contract<F>(
     smc_file: &str,
     smc_balance: Option<&str>,
     msg_info: MsgInfo,
+    config_file: Option<&str>,
     key_file: Option<Option<&str>>,
     ticktock: Option<i8>,
     gas_limit: Option<i64>,
     action_decoder: Option<F>,
-    debug: bool,
-    debug_info_filename: String,
+    trace_level: TraceLevel,
+    debug_map_filename: String,
 ) -> i32
     where F: Fn(SliceData, bool)
 {
     let addr = AccountId::from_str(smc_file).unwrap();
     let addr_int = IntegerData::from_str_radix(smc_file, 16).unwrap();
     let state_init = load_from_file(&format!("{}.tvc", smc_file));
-    let debug_info = load_debug_info(&state_init, debug_info_filename);
+    let debug_info = load_debug_info(debug_map_filename);
+    let config_cell = config_file.map(|filename| {
+        let state = load_from_file(filename);
+        let (_code, data) = load_code_and_data(&state);
+        // config dictionary is located in the first reference of the storage root cell
+        data.into_cell().reference(0).unwrap()
+    });
     let (exit_code, state_init) = call_contract_ex(
         addr, addr_int, state_init, debug_info, smc_balance,
-        msg_info, key_file, ticktock, gas_limit, action_decoder, debug);
+        msg_info, config_cell, key_file, ticktock, gas_limit, action_decoder, trace_level);
     if exit_code == 0 || exit_code == 1 {
         let smc_name = smc_file.to_owned() + ".tvc";
         save_to_file(state_init, Some(&smc_name), 0).expect("error");
@@ -263,7 +290,32 @@ pub fn call_contract<F>(
     exit_code
 }
 
-fn trace_callback(_engine: &Engine, info: &EngineTraceInfo, extended: bool, debug_info: &Option<ContractDebugInfo>) {
+fn get_position(info: &EngineTraceInfo, debug_info: &Option<DbgInfo>) -> Option<String> {
+    if let Some(debug_info) = debug_info {
+        let cell_hash = info.cmd_code.cell().repr_hash().to_hex_string();
+        let offset = info.cmd_code.pos();
+        let position = match debug_info.map.get(&cell_hash) {
+            Some(offset_map) => match offset_map.get(&offset) {
+                Some(pos) => format!("{}:{}", pos.filename, pos.line),
+                None => String::from("-:0 (offset not found)")
+            },
+            None => String::from("-:0 (cell hash not found)")
+        };
+        return Some(position)
+    }
+    None
+}
+
+fn trace_callback_minimal(_engine: &Engine, info: &EngineTraceInfo, debug_info: &Option<DbgInfo>) {
+    print!("{} {} {} {}", info.step, info.gas_used, info.gas_cmd, info.cmd_str);
+    let position =  get_position(info, debug_info);
+    if position.is_some() {
+        print!(" {}", position.unwrap());
+    }
+    println!();
+}
+
+fn trace_callback(_engine: &Engine, info: &EngineTraceInfo, extended: bool, debug_info: &Option<DbgInfo>) {
 
     if info.info_type == EngineTraceInfoType::Dump {
         println!("{}", info.cmd_str);
@@ -285,13 +337,9 @@ fn trace_callback(_engine: &Engine, info: &EngineTraceInfo, extended: bool, debu
         info.gas_cmd
     );
 
-    if let Some(debug_info) = debug_info {
-        // TODO: move
-        let fname = match debug_info.hash2function.get(&info.cmd_code.cell().repr_hash()) {
-            Some(fname) => fname,
-            None => "n/a"
-        };
-        println!("function: {}", fname);
+    let position = get_position(info, debug_info);
+    if position.is_some() {
+        println!("Position: {}", position.unwrap());
     }
 
     println!("\n--- Stack trace ------------------------");
@@ -305,14 +353,15 @@ pub fn call_contract_ex<F>(
     addr: AccountId,
     addr_int: IntegerData,
     state_init: StateInit,
-    debug_info: Option<ContractDebugInfo>,
+    debug_info: Option<DbgInfo>,
     smc_balance: Option<&str>,
     msg_info: MsgInfo,
+    config: Option<Cell>,
     key_file: Option<Option<&str>>,
     ticktock: Option<i8>,
     gas_limit: Option<i64>,
     action_decoder: Option<F>,
-    debug: bool,
+    trace_level: TraceLevel,
 ) -> (i32, StateInit)
     where F: Fn(SliceData, bool)
 {
@@ -326,7 +375,7 @@ pub fn call_contract_ex<F>(
     let msg = create_inbound_msg(func_selector, &msg_info, addr.clone());
 
     if !log_enabled!(Error) {
-        init_logger(debug);
+        init_logger(trace_level == TraceLevel::Full);
     }
 
     let mut state_init = state_init;
@@ -339,6 +388,7 @@ pub fn call_contract_ex<F>(
         MsgAddressInt::with_standart(None, workchain_id, addr.clone()).unwrap(),
         msg_info.now,
         (smc_value.clone(), smc_balance),
+        config,
     );
 
     let mut stack = Stack::new();
@@ -378,8 +428,10 @@ pub fn call_contract_ex<F>(
 
     let mut engine = Engine::new().setup_with_libraries(code, Some(registers), Some(stack), Some(gas), vec![]);
     engine.set_trace(0);
-    if debug {
-        engine.set_trace_callback(move |engine, info| { trace_callback(engine, info, true, &debug_info); })
+    match trace_level {
+        TraceLevel::Full => engine.set_trace_callback(move |engine, info| { trace_callback(engine, info, true, &debug_info); }),
+        TraceLevel::Minimal => engine.set_trace_callback(move |engine, info| { trace_callback_minimal(engine, info, &debug_info); }),
+        TraceLevel::None => {}
     }
     let exit_code = match engine.execute() {
         Err(exc) => match tvm_exception(exc) {
@@ -416,7 +468,7 @@ pub fn perform_contract_call<F>(
     contract_file: &str,
     body: Option<SliceData>,
     key_file: Option<Option<&str>>,
-    debug: bool,
+    trace_level: TraceLevel,
     decode_c5: bool,
     msg_balance: Option<&str>,
     ticktock: Option<i8>,
@@ -432,17 +484,18 @@ pub fn perform_contract_call<F>(
         balance,
         MsgInfo{
             balance: msg_balance,
-            src: src,
-            now: now,
+            src,
+            now,
             bounced: false,
-            body: body
+            body
         },
+        None,
         key_file,
         ticktock,
         None,
         if decode_c5 { Some(action_decoder) } else { None },
-        debug,
-        String::from("")
+        trace_level,
+        String::from(""),
     )
 }
 
