@@ -279,10 +279,10 @@ pub fn call_contract<F>(
         // config dictionary is located in the first reference of the storage root cell
         data.into_cell().reference(0).unwrap()
     });
-    let (exit_code, state_init) = call_contract_ex(
+    let (exit_code, state_init, is_vm_success) = call_contract_ex(
         addr, addr_int, state_init, debug_info, smc_balance,
         msg_info, config_cell, key_file, ticktock, gas_limit, action_decoder, trace_level);
-    if exit_code == 0 || exit_code == 1 {
+    if is_vm_success {
         let smc_name = smc_file.to_owned() + ".tvc";
         save_to_file(state_init, Some(&smc_name), 0).expect("error");
         println!("Contract persistent data updated");
@@ -362,15 +362,13 @@ pub fn call_contract_ex<F>(
     gas_limit: Option<i64>,
     action_decoder: Option<F>,
     trace_level: TraceLevel,
-) -> (i32, StateInit)
+) -> (i32, StateInit, bool)
     where F: Fn(SliceData, bool)
 {
     let func_selector = match msg_info.balance {
         Some(_) => 0,
         None => if ticktock.is_some() { -2 } else { -1 },
     };
-
-    let (value, _) = decode_balance(msg_info.balance).unwrap();
 
     let msg = create_inbound_msg(func_selector, &msg_info, addr.clone());
 
@@ -404,12 +402,18 @@ pub fn call_contract_ex<F>(
             key_file.map(|key| sign_body(&mut body, key));
         }
 
+        let msg_value = if func_selector == 0 {
+            decode_balance(msg_info.balance).unwrap().0 // for internal message
+        } else {
+            0 // for external message
+        };
+
         stack
-            .push(int!(smc_value))
-            .push(int!(value))              //msg balance
-            .push(msg_cell)                 //msg
-            .push(StackItem::Slice(body))   //msg.body
-            .push(int!(func_selector));     //selector
+            .push(int!(smc_value))        // contract balance
+            .push(int!(msg_value))        // msg value
+            .push(msg_cell)               // whole msg
+            .push(StackItem::Slice(body)) // msg body
+            .push(int!(func_selector));   //selector
     } else {
         stack
             .push(int!(smc_value))
@@ -443,7 +447,10 @@ pub fn call_contract_ex<F>(
         }
         Ok(code) => code,
     };
+
+    let is_vm_success = engine.get_committed_state().is_committed();
     println!("TVM terminated with exit code {}", exit_code);
+    println!("Computing phase is success: {}", is_vm_success);
     println!("Gas used: {}", engine.get_gas().get_gas_used());
     println!();
     println!("{}", engine.dump_stack("Post-execution stack state", false));
@@ -460,7 +467,7 @@ pub fn call_contract_ex<F>(
         };
     }
 
-    (exit_code, state_init)
+    (exit_code, state_init, is_vm_success)
 }
 
 #[cfg(test)]
