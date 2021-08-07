@@ -68,15 +68,15 @@ impl Program {
                 data_dict = HashmapE::with_hashmap(64, persistent_data)
             }
         }
-        let key = ptr_to_builder(persistent_base)?.into();
+        let key:SliceData = ptr_to_builder(persistent_base)?.into_cell().map_err(|e| format!("failed to pack body in cell: {}", e))?.into();
         BuilderData::with_raw(bytes.to_vec(), PUBLIC_KEY_LENGTH * 8)
-            .and_then(|data| data_dict.set(key, &data.into()))
+            .and_then(|data| data_dict.set(key, &data.into_cell()?.into()))
             .map_err(|e| format!("failed to pack pubkey to data dictionary: {}", e))?;
         let mut builder = BuilderData::new();
         builder
             .append_bit_one().unwrap()
             .checked_append_reference(data_dict.data().unwrap().clone()).unwrap();
-        Ok(builder.into())
+        Ok(builder.into_cell().map_err(|e| format!("failed to pack body in cell: {}", e))?)
     }
 
     #[allow(dead_code)]
@@ -85,9 +85,9 @@ impl Program {
     }
 
     pub fn internal_method_dict(&mut self) -> std::result::Result<Option<Cell>, String> {
-        let dict = prepare_methods(&self.engine.privates(), true)
+        let mut dict = prepare_methods(&self.engine.privates(), true)
             .map_err(|e| e.1.replace("_name_", &self.engine.global_name(e.0).unwrap()))?;
-        self.dbgmap.map.append(&mut dict.1.map.clone());
+        self.dbgmap.append(&mut dict.1);
         Ok(dict.0.data().map(|cell| cell.clone()))
     }
 
@@ -105,7 +105,7 @@ impl Program {
         insert_methods(&mut dict.0, &mut dict.1, &self.publics_filtered(remove_ctor), true)
             .map_err(|e| e.1.replace("_name_", &self.engine.global_name(e.0).unwrap()) )?;
 
-        self.dbgmap.map.append(&mut dict.1.map);
+        self.dbgmap.append(&mut dict.1);
 
         Ok(dict.0.data().map(|cell| cell.clone()))
     }
@@ -133,7 +133,12 @@ impl Program {
             let data_cell = deserialize_cells_tree(&mut data_cursor).unwrap().remove(0);
             state_init.set_data(data_cell);
         }
-        save_to_file(state_init, out_file, wc)
+        let ret = save_to_file(state_init.clone(), out_file, wc);
+        if out_file.is_some() && ret.is_ok() {
+            println!("Contract successfully compiled. Saved to file {}.", out_file.unwrap());
+            println!("Contract address: {:x}", state_init.hash().unwrap());
+        }
+        return ret;
     }
 
     fn apply_constructor(
@@ -157,7 +162,7 @@ impl Program {
             None,   // header,
             None,   // key_file,
             false   // is_internal
-        )?.into();
+        )?.into_cell().map_err(|e| format!("failed to pack body in cell: {}", e))?.into();
 
         let (exit_code, mut state_init, is_vm_success) = call_contract_ex(
             AccountId::from(UInt256::default()),
@@ -207,10 +212,10 @@ impl Program {
         internal_selector.0.append_reference(self.internal_method_dict()?.unwrap_or_default().into());
 
         // adjust hash of internal_selector cell
-        let hash = internal_selector.0.cell().repr_hash().to_hex_string();
-        assert!(internal_selector.1.map.len() == 1);
-        let entry = internal_selector.1.map.iter().next().unwrap();
-        self.dbgmap.map.insert(hash, entry.1.clone());
+        let hash = internal_selector.0.cell().repr_hash();
+        assert_eq!(internal_selector.1.len(), 1);
+        let entry = internal_selector.1.first_entry().unwrap();
+        self.dbgmap.insert(hash, entry.clone());
 
         let mut main_selector = compile_code_debuggable(self.entry())
             .map_err(|e| e.to_string())?;
@@ -218,10 +223,10 @@ impl Program {
         main_selector.0.append_reference(internal_selector.0);
 
         // adjust hash of main_selector cell
-        let hash = main_selector.0.cell().repr_hash().to_hex_string();
-        assert!(main_selector.1.map.len() == 1);
-        let entry = main_selector.1.map.iter().next().unwrap();
-        self.dbgmap.map.insert(hash, entry.1.clone());
+        let hash = main_selector.0.cell().repr_hash();
+        assert_eq!(main_selector.1.len(), 1);
+        let entry = main_selector.1.first_entry().unwrap();
+        self.dbgmap.insert(hash, entry.clone());
 
         Ok(main_selector.0.cell().clone())
     }
@@ -252,13 +257,15 @@ impl Program {
 
         let mut entry_points = vec![];
         for id in -2..1 {
-            let key = id.write_to_new_cell().unwrap().into();
+            let key = id.serialize()
+                .map_err(|e| format!("failed to pack body in cell: {}", e))?
+                .into();
             let value = dict.0.remove(key).unwrap();
             entry_points.push(value.unwrap_or(SliceData::default()));
         }
 
         internal_selector.0.append_reference(SliceData::from(dict.0.data().unwrap_or(&Cell::default())));
-        self.dbgmap.map.append(&mut dict.1.map.clone());
+        self.dbgmap.append(&mut dict.1);
 
         let version = self.engine.version();
         match version {
@@ -270,10 +277,10 @@ impl Program {
         }
 
         // adjust hash of internal_selector cell
-        let hash = internal_selector.0.cell().repr_hash().to_hex_string();
-        assert_eq!(internal_selector.1.map.len(), 1);
-        let entry = internal_selector.1.map.iter().next().unwrap();
-        self.dbgmap.map.insert(hash, entry.1.clone());
+        let hash = internal_selector.0.cell().repr_hash();
+        assert_eq!(internal_selector.1.len(), 1);
+        let entry = internal_selector.1.first_entry().unwrap();
+        self.dbgmap.insert(hash, entry.clone());
 
         let entry_selector_text = vec![
             Line::new("PUSHREFCONT\n", "<entry-selector>", 1),
@@ -299,10 +306,10 @@ impl Program {
         }
 
         // adjust hash of entry_selector cell
-        let hash = entry_selector.0.cell().repr_hash().to_hex_string();
-        assert_eq!(entry_selector.1.map.len(), 1);
-        let entry = entry_selector.1.map.iter().next().unwrap();
-        self.dbgmap.map.insert(hash, entry.1.clone());
+        let hash = entry_selector.0.cell().repr_hash();
+        assert_eq!(entry_selector.1.len(), 1);
+        let entry = entry_selector.1.first_entry().unwrap();
+        self.dbgmap.insert(hash, entry.clone());
 
         if !self.engine.save_my_code() {
             return Ok(entry_selector.0.cell().clone())
@@ -319,17 +326,17 @@ impl Program {
         ];
         let mut save_my_code = compile_code_debuggable(save_my_code_text.clone())
             .map_err(|e| e.to_string())?;
-        assert_eq!(save_my_code.1.map.len(), 2);
-        let old_hash = save_my_code.0.cell().repr_hash().to_hex_string();
-        let entry = save_my_code.1.map.get(&old_hash).unwrap();
+        assert_eq!(save_my_code.1.len(), 2);
+        let old_hash = save_my_code.0.cell().repr_hash();
+        let entry = save_my_code.1.get(&old_hash).unwrap();
         save_my_code.0.append_reference(entry_selector.0);
 
-        let hash = save_my_code.0.cell().repr_hash().to_hex_string();
-        self.dbgmap.map.insert(hash, entry.clone());
+        let hash = save_my_code.0.cell().repr_hash();
+        self.dbgmap.insert(hash, entry.clone());
 
-        let inner_hash = save_my_code.0.reference(0).unwrap().repr_hash().to_hex_string();
-        let entry = save_my_code.1.map.get(&inner_hash).unwrap();
-        self.dbgmap.map.insert(inner_hash, entry.clone());
+        let inner_hash = save_my_code.0.reference(0).unwrap().repr_hash();
+        let entry = save_my_code.1.get(&inner_hash).unwrap();
+        self.dbgmap.insert(inner_hash, entry.clone());
 
         Ok(save_my_code.0.cell().clone())
     }
@@ -342,7 +349,8 @@ impl Program {
 pub fn save_to_file(state: StateInit, name: Option<&str>, wc: i8) -> std::result::Result<String, String> {
     let root_cell = state.write_to_new_cell()
         .map_err(|e| format!("Serialization failed: {}", e))?
-        .into();
+        .into_cell()
+        .map_err(|e| format!("failed to pack body in cell: {}", e))?;
     let mut buffer = vec![];
     BagOfCells::with_root(&root_cell).write_to(&mut buffer, false)
         .map_err(|e| format!("BOC failed: {}", e))?;
@@ -360,7 +368,7 @@ pub fn save_to_file(state: StateInit, name: Option<&str>, wc: i8) -> std::result
     file.write_all(&buffer).map_err(|e| format!("Write to file failed: {}", e))?;
 
     if print_filename {
-        println! ("Saved contract to file {}", &file_name);
+        println!("Saved contract to file {}", &file_name);
         println!("testnet:");
         println!("Non-bounceable address (for init): {}", &calc_userfriendly_address(wc, address.as_slice(), false, true));
         println!("Bounceable address (for later access): {}", &calc_userfriendly_address(wc, address.as_slice(), true, true));
@@ -381,16 +389,21 @@ fn calc_userfriendly_address(wc: i8, addr: &[u8], bounce: bool, testnet: bool) -
     encode(&bytes)
 }
 
-pub fn load_from_file(contract_file: &str) -> StateInit {
-    let mut csor = Cursor::new(std::fs::read(contract_file).unwrap());
-    let mut cell = deserialize_cells_tree(&mut csor).unwrap().remove(0);
+pub fn load_from_file(contract_file: &str) -> Result<StateInit, String> {
+    let mut csor = Cursor::new(
+        std::fs::read(contract_file)
+            .map_err(|e| format!("failed to read file {}: {}", contract_file, e))?
+    );
+    let mut cell = deserialize_cells_tree(&mut csor)
+        .map_err(|e| format!("failed to deserialize cell tree: {}", e))?
+        .remove(0);
     // try appending a dummy library cell if there is no such cell in the tvc file
     if cell.references_count() == 2 {
         let mut adjusted_cell = BuilderData::from(cell);
         adjusted_cell.append_reference(BuilderData::default());
-        cell = adjusted_cell.into();
+        cell = adjusted_cell.into_cell().expect("Cell construction failed");
     }
-    StateInit::construct_from_cell(cell).expect("StateInit construction failed")
+    Ok(StateInit::construct_from_cell(cell).expect("StateInit construction failed"))
 }
 
 pub fn get_now() -> u32 {
@@ -430,7 +443,7 @@ mod tests {
             let mut b = BuilderData::new();
             b.append_u32(abi::gen_abi_id(None, "main")).unwrap();
             b.append_reference(BuilderData::new());
-            Some(b.into())
+            Some(b.into_cell().unwrap().into())
         };
         let contract_file = prog.compile_to_file(0).unwrap();
         let name = contract_file.split('.').next().unwrap();
@@ -448,7 +461,7 @@ mod tests {
         let body = {
             let mut b = BuilderData::new();
             b.append_u32(abi::gen_abi_id(None, "main")).unwrap();
-            Some(b.into())
+            Some(b.into_cell().unwrap().into())
         };
         let contract_file = prog.compile_to_file(0).unwrap();
         let name = contract_file.split('.').next().unwrap();
@@ -467,7 +480,7 @@ mod tests {
         let body = {
             let buf = hex::decode("000D6E4079").unwrap();
             let buf_bits = buf.len() * 8;
-            Some(BuilderData::with_raw(buf, buf_bits).unwrap().into())
+            Some(BuilderData::with_raw(buf, buf_bits).unwrap().into_cell().unwrap().into())
         };
         let contract_file = prog.compile_to_file(0).unwrap();
         let name = contract_file.split('.').next().unwrap();
@@ -508,7 +521,7 @@ mod tests {
         let body = {
             let mut b = BuilderData::new();
             b.append_u32(abi::gen_abi_id(None, "main")).unwrap();
-            Some(b.into())
+            Some(b.into_cell().unwrap().into())
         };
 
         assert_eq!(perform_contract_call(name, body, Some(Some("key1")), TraceLevel::None, false, None, None, None, None, 0, |_b,_i| {}), 0);
@@ -533,7 +546,7 @@ mod tests {
             let mut b = BuilderData::new();
             b.append_u32(abi::gen_abi_id(None, "sum")).unwrap();
             b.append_reference(BuilderData::new());
-            Some(b.into())
+            Some(b.into_cell().unwrap().into())
         };
 
         assert_eq!(perform_contract_call(name, body1, None, TraceLevel::None, false, None, None, None, None, 0, |_b,_i| {}), 0);
@@ -542,7 +555,7 @@ mod tests {
             let mut b = BuilderData::new();
             b.append_u32(abi::gen_abi_id(None, "sum_p")).unwrap();
             b.append_reference(BuilderData::new());
-            Some(b.into())
+            Some(b.into_cell().unwrap().into())
         };
         assert!(perform_contract_call(name, body2, None, TraceLevel::None, false, None, None, None, None, 0, |_b,_i| {}) != 0);
 
@@ -550,7 +563,7 @@ mod tests {
             let mut b = BuilderData::new();
             b.append_u32(abi::gen_abi_id(Some(abi), "sum2")).unwrap();
             b.append_reference(BuilderData::new());
-            Some(b.into())
+            Some(b.into_cell().unwrap().into())
         };
         assert_eq!(perform_contract_call(name, body3, None, TraceLevel::None, false, None, None, None, None, 0, |_b,_i| {}), 0);
     }
@@ -570,6 +583,7 @@ mod tests {
         let body = abi::build_abi_body("./tests/Wallet.abi.json", "constructor", "{}", None, None, false)
             .unwrap();
         let exit_code = call_contract(
+            &contract_file,
             &name,
             Some("10000000000"), //account balance 10T
             MsgInfo {
@@ -577,7 +591,7 @@ mod tests {
                 src: None,
                 now: 1,
                 bounced: false,
-                body: Some(body.into())
+                body: Some(body.into_cell().unwrap().into())
             },
             None,
             None,
@@ -588,7 +602,8 @@ mod tests {
             String::from(""),
         );
         // must equal to out of gas exception
-        assert_eq!(exit_code, 13);
+        assert!(exit_code.is_ok());
+        assert_eq!(exit_code.unwrap(), 13);
     }
 
     #[test]
@@ -611,6 +626,7 @@ mod tests {
             .unwrap();
 
         let exit_code = call_contract(
+            &contract_file,
             &name,
             Some("10000000000"), //account balance 10T
             MsgInfo {
@@ -618,7 +634,7 @@ mod tests {
                 src: None,
                 now: 1,
                 bounced: false,
-                body: Some(body.into())
+                body: Some(body.into_cell().unwrap().into())
             },
             None,
             None,
@@ -628,7 +644,8 @@ mod tests {
             TraceLevel::Full,
             debug_map_filename,
         );
-        assert_eq!(exit_code, 0);
+        assert!(exit_code.is_ok());
+        assert_eq!(exit_code.unwrap(), 0);
     }
 
     fn get_version(filename: &str) -> String {

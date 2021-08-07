@@ -41,7 +41,7 @@ fn disasm_graphviz_command(m: &ArgMatches) -> Result<(), String> {
     let filename = m.value_of("TVC");
     let tvc = filename.map(|f| std::fs::read(f))
         .transpose()
-        .map_err(|e| format!(" failed to read tvc file: {}", e))?
+        .map_err(|e| format!(" failed to read tvc file {}: {}", filename.unwrap(), e))?
         .unwrap();
     let mut csor = Cursor::new(tvc);
     let mut roots = deserialize_cells_tree(&mut csor).unwrap();
@@ -61,7 +61,7 @@ fn disasm_graphviz_command(m: &ArgMatches) -> Result<(), String> {
                 if dict.len().is_err() {
                     return Err("empty internal methods dictionary".to_string())
                 }
-                let key = method_id.write_to_new_cell().unwrap().into();
+                let key = method_id.serialize().unwrap().into();
                 let data = dict.get(key).map_err(|e| -> String { e.to_string() })?
                     .ok_or(format!("internal method {} not found", method_id))?;
                 let cell = data.into_cell();
@@ -123,7 +123,7 @@ fn disasm_dump_command(m: &ArgMatches) -> Result<(), String> {
     let filename = m.value_of("TVC");
     let tvc = filename.map(|f| std::fs::read(f))
         .transpose()
-        .map_err(|e| format!(" failed to read tvc file: {}", e))?
+        .map_err(|e| format!(" failed to read tvc file {}: {}", filename.unwrap(), e))?
         .unwrap();
     let mut csor = Cursor::new(tvc);
     let mut roots = deserialize_cells_tree(&mut csor).unwrap();
@@ -136,7 +136,7 @@ fn disasm_solidity_v1_command(m: &ArgMatches) -> Result<(), String> {
     let filename = m.value_of("TVC");
     let tvc = filename.map(|f| std::fs::read(f))
         .transpose()
-        .map_err(|e| format!(" failed to read tvc file: {}", e))?
+        .map_err(|e| format!(" failed to read tvc file {}: {}", filename.unwrap(), e))?
         .unwrap();
     let mut csor = Cursor::new(tvc);
     let roots = deserialize_cells_tree(&mut csor);
@@ -197,7 +197,7 @@ fn disasm_solidity_command(m: &ArgMatches) -> Result<(), String> {
     let filename = m.value_of("TVC");
     let tvc = filename.map(|f| std::fs::read(f))
         .transpose()
-        .map_err(|e| format!(" failed to read tvc file: {}", e))?
+        .map_err(|e| format!(" failed to read tvc file {}: {}", filename.unwrap(), e))?
         .unwrap();
     let mut csor = Cursor::new(tvc);
     let roots = deserialize_cells_tree(&mut csor);
@@ -250,7 +250,7 @@ fn disasm_fun_c_command(m: &ArgMatches) -> Result<(), String> {
     let filename = m.value_of("TVC");
     let tvc = filename.map(|f| std::fs::read(f))
         .transpose()
-        .map_err(|e| format!(" failed to read tvc file: {}", e))?
+        .map_err(|e| format!(" failed to read tvc file {}: {}", filename.unwrap(), e))?
         .unwrap();
     let mut csor = Cursor::new(tvc);
     let roots = deserialize_cells_tree(&mut csor);

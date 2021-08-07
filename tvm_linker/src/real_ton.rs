@@ -34,7 +34,7 @@ pub fn load_stateinit(file_name: &str) -> (SliceData, Vec<u8>) {
     if root.references_count() == 2 { // append empty library cell
         let mut adjusted_cell = BuilderData::from(root);
         adjusted_cell.append_reference(BuilderData::default());
-        root = adjusted_cell.into();
+        root = adjusted_cell.into_cell().expect("Error serialize cell");
     }
     (SliceData::from(root), orig_bytes)
 }
@@ -70,7 +70,7 @@ pub fn compile_message(
         AccountId::from_str(address_str).map_err(|_| "input string is not a valid address".to_string())?
     ).unwrap();
 
-    let state = if pack_code { Some(load_from_file(&format!("{}.tvc", address_str))) } else { None };
+    let state = if pack_code { Some(load_from_file(&format!("{}.tvc", address_str))?) } else { None };
     
     let mut msg_hdr = ExternalInboundMessageHeader::default();
     msg_hdr.dst = dest_address;
@@ -78,7 +78,7 @@ pub fn compile_message(
     *msg.state_init_mut() = state;
     *msg.body_mut() = body;
 
-    let root_cell = msg.write_to_new_cell().unwrap().into();
+    let root_cell = msg.serialize().map_err(|e| format!("failed to pack msg in cell: {}", e))?;
     let boc = BagOfCells::with_root(&root_cell);
     let mut bytes = Vec::new();
     let mode = BocSerialiseMode::Generic { index: false, crc: true, cache_bits: false, flags: 0 };
@@ -88,7 +88,7 @@ pub fn compile_message(
 
     let output_file_name = address_str.get(0..8).unwrap().to_string() + suffix;
     let mut f = File::create(&output_file_name).map_err(|_| "Unable to create msg file".to_string())?;
-    f.write_all(&bytes).map_err(|_| "Unable to write_data to msg file".to_string())?;
+    f.write_all(&bytes).map_err(|_| format!("Unable to write_data to msg file {}", output_file_name))?;
 
     println!("boc file created: {}", output_file_name);
     Ok(())
